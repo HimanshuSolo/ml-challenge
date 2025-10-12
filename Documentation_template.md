@@ -48,9 +48,9 @@ The model follows an enhanced pipeline:
 ### 3.2 Model Components
 
 **Text Processing Pipeline:**
-- [x] Preprocessing steps: Lowercase text, fill NaN with empty string, encode with 'multi-qa-mpnet-base-dot-v1', add text length
-- [x] Model type: [] 
-- [ ] Key parameters: []
+- [x] Preprocessing steps: Lowercase text, fill NaN with empty string, encode with `'multi-qa-mpnet-base-dot-v1'`, add text length
+- [x] Model type: SentenceTransformer for semantic embeddings.
+- [x] Key parameters: 768 dimensions, batch_size=32.
 
 **Image Processing Pipeline:**
 - [ ] Preprocessing steps: []

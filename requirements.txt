@@ -5,3 +5,4 @@ lightgbm>=4.6
 scipy>=1.7
 tqdm>=4.67.1
 sentence_transformers>=5.1.1
+torchvision>=0.23.0
