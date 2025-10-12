@@ -3,10 +3,10 @@ import re
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split, KFold, StratifiedKFold
-from sklearn.metrics import mean_squared_error
 import lightgbm as lgb
 from sentence_transformers import SentenceTransformer
-from scipy import sparse as sp
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
 from tqdm import tqdm
 import requests
 from PIL import Image
@@ -15,28 +15,42 @@ from torchvision import models, transforms
 import warnings
 warnings.filterwarnings('ignore')
 
-# Assume download_images is available from src/utils.py
+SMOKE = bool(int(os.environ.get('SMOKE', '0')))
+NO_IMAGES = bool(int(os.environ.get('NO_IMAGES', '0')))
+CACHE_DIR = os.path.join('dataset', 'cache')
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# --- fallback image downloader if src.utils not available ---
 try:
     from src.utils import download_images
-except ImportError:
+except Exception:
     def download_images(url, save_path):
-        """Fallback function if download_images is not available."""
+        """Fallback download images; returns True if saved, False otherwise."""
         try:
-            response = requests.get(url, stream=True, timeout=10)
+            response = requests.get(url, stream=True, timeout=8)
             response.raise_for_status()
             with open(save_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                    if chunk:
+                        f.write(chunk)
+            return True
         except Exception:
+            if os.path.exists(save_path):
+                try:
+                    os.remove(save_path)
+                except Exception:
+                    pass
             return False
-        return True
+
+# globals used by predictor
+model = None
+embedder = None
+resnet = None
+preprocess = None
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # IPQ extraction function
 def extract_ipq(text):
-    """
-    Extract Item Pack Quantity (IPQ) from text using regex patterns.
-    Returns 1 if no match is found.
-    """
     if not isinstance(text, str):
         return 1
     text = text.lower()
@@ -57,111 +71,235 @@ def extract_ipq(text):
     m = re.search(r'\b(\d+)\s*(?:items|units)?\b', text)
     return max(1, int(m.group(1))) if m else 1
 
-# Feature engineering function
-def create_features(df, embedder, image_dir="dataset/images/"):
+# Feature engineering
+def create_features(df, embedder_obj=None, image_dir="dataset/images/"):
     """
-    Create combined features from text and images.
+    Create features for text (embeddings or TF-IDF+SVD) and images (ResNet).
+    Returns numpy array of shape (n_samples, feature_dim).
     """
+    global resnet, preprocess, device
+
     os.makedirs(image_dir, exist_ok=True)
-    catalog_content = df['catalog_content'].fillna('')
-    # Text features
-    embeddings = embedder.encode(catalog_content.tolist(), show_progress_bar=True, batch_size=32)
-    ipq = np.log1p(catalog_content.apply(extract_ipq)).values.reshape(-1, 1)
-    text_length = np.log1p(catalog_content.str.len().values.reshape(-1, 1))
-    
-    # Image features
-    image_links = df['image_link'].values
-    image_features = np.zeros((len(df), 1000))  # 1000 dims from ResNet-50
-    preprocess = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    resnet = models.resnet50(pretrained=True)
-    resnet.eval()
-    with torch.no_grad():
-        for i, url in enumerate(tqdm(image_links, desc="Processing images")):
-            save_path = os.path.join(image_dir, f"img_{i}.jpg")
-            if download_images(url, save_path):
-                try:
-                    img = Image.open(save_path).convert('RGB')
-                    img = preprocess(img).unsqueeze(0)
-                    feature = resnet(img).flatten().numpy()
-                    image_features[i] = feature
-                except Exception:
-                    continue  # Skip failed images
-            os.remove(save_path)  # Clean up after processing
-    
-    return np.hstack((embeddings, ipq, text_length, image_features))
+    catalog_content = df['catalog_content'].fillna('').astype(str)
 
-# Predictor function
-def predictor(sample_id, catalog_content, image_link):
-    """
-    Predict price using a trained LightGBM model based on text and image features.
-    
-    Parameters:
-    - sample_id: Unique identifier for the sample
-    - catalog_content: Text containing product title and description
-    - image_link: URL to product image
-    
-    Returns:
-    - price: Predicted price as a float
-    """
-    global model, embedder, resnet, preprocess
-    embedding = embedder.encode([catalog_content], show_progress_bar=False)[0].reshape(1, -1)
-    ipq = np.log1p(extract_ipq(catalog_content)).reshape(1, -1)
-    text_len = np.log1p(len(catalog_content) if isinstance(catalog_content, str) else 0).reshape(1, -1)
-    
-    # Process image
-    save_path = f"temp_img_{sample_id}.jpg"
-    if download_images(image_link, save_path):
-        try:
-            img = Image.open(save_path).convert('RGB')
-            img = preprocess(img).unsqueeze(0)
-            with torch.no_grad():
-                image_feature = resnet(img).flatten().numpy().reshape(1, -1)
-        except Exception:
-            image_feature = np.zeros((1, 1000))
-        os.remove(save_path)
+    # 1) Text embeddings or TF-IDF+SVD fallback
+    if SMOKE or embedder_obj is None:
+        tfidf_cache = os.path.join(CACHE_DIR, f'tfidf_svd_smoke{int(SMOKE)}.npz')
+        if os.path.exists(tfidf_cache):
+            data = np.load(tfidf_cache)
+            embeddings = data['emb']
+        else:
+            max_feats = 2000 if SMOKE else 5000
+            tfidf = TfidfVectorizer(max_features=max_feats, ngram_range=(1,2), min_df=2)
+            X_tfidf = tfidf.fit_transform(catalog_content.tolist())
+            n_comp = 50 if SMOKE else 150
+            svd = TruncatedSVD(n_components=min(n_comp, X_tfidf.shape[1]-1 or 1), random_state=42)
+            embeddings = svd.fit_transform(X_tfidf)
+            np.savez_compressed(tfidf_cache, emb=embeddings)
     else:
-        image_feature = np.zeros((1, 1000))
-    
-    X = np.hstack((embedding, ipq, text_len, image_feature))
-    pred_log_price = model.predict(X)[0]
-    return round(max(0.01, np.expm1(pred_log_price)), 2)
+        embed_cache = os.path.join(CACHE_DIR, f'emb_{embedder_obj.__class__.__name__}_smoke{int(SMOKE)}.npz')
+        if os.path.exists(embed_cache):
+            data = np.load(embed_cache)
+            embeddings = data['emb']
+        else:
+            # prefer using the right device if sentence-transformers supports it
+            encode_kwargs = dict(show_progress_bar=True, batch_size=64)
+            try:
+                embeddings = embedder_obj.encode(catalog_content.tolist(), device=str(device), **encode_kwargs)
+            except TypeError:
+                # fallback if embedder doesn't accept device param
+                embeddings = embedder_obj.encode(catalog_content.tolist(), **encode_kwargs)
+            embeddings = np.asarray(embeddings, dtype=np.float32)
+            np.savez_compressed(embed_cache, emb=embeddings)
 
+    # small numeric features
+    ipq = np.log1p(catalog_content.apply(extract_ipq)).values.reshape(-1, 1).astype(np.float32)
+    text_length = np.log1p(catalog_content.str.len().values.reshape(-1, 1)).astype(np.float32)
+
+    n = len(df)
+    # prepare image features
+    image_features = np.zeros((n, 1000), dtype=np.float32)  # final resnet classifier output dim
+
+    # prepare ResNet and preprocess once (only if using images)
+    if not NO_IMAGES:
+        # define preprocess if not already
+        preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        # load resnet if not loaded
+        if resnet is None:
+            resnet = models.resnet50(pretrained=True)
+            resnet = resnet.to(device)
+            resnet.eval()
+        else:
+            resnet = resnet.to(device)
+            resnet.eval()
+
+        image_links = df.get('image_link', pd.Series(['']*n)).fillna('').values
+
+        # iterate images (sequentially). Use try/except to skip failures.
+        for i, url in enumerate(tqdm(image_links, desc="Processing images", disable=SMOKE)):
+            if not url:
+                continue
+            save_path = os.path.join(image_dir, f"img_{i}.jpg")
+            ok = download_images(url, save_path)
+            if not ok or not os.path.exists(save_path):
+                # skip
+                continue
+            try:
+                with Image.open(save_path) as img:
+                    img = img.convert('RGB')
+                    img_t = preprocess(img).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        feat = resnet(img_t)  # (1,1000)
+                    feat = feat.cpu().numpy().reshape(-1)
+                    if feat.shape[0] == 1000:
+                        image_features[i] = feat.astype(np.float32)
+            except Exception:
+                # skip this image
+                pass
+            finally:
+                try:
+                    os.remove(save_path)
+                except Exception:
+                    pass
+    else:
+        # NO_IMAGES mode: keep image_features as zeros
+        pass
+
+    # combine everything
+    # ensure embeddings is numpy and 2D
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    if embeddings.ndim == 1:
+        embeddings = embeddings.reshape(-1, 1)
+
+    # ensure shapes align
+    assert embeddings.shape[0] == n, f"Embeddings rows {embeddings.shape[0]} != samples {n}"
+
+    X = np.hstack((embeddings, ipq, text_length, image_features)).astype(np.float32)
+    return X
+
+# predictor that uses global model, embedder, resnet, preprocess
+def predictor(sample_id, catalog_content, image_link):
+    global model, embedder, resnet, preprocess, device
+    if model is None or embedder is None:
+        raise RuntimeError("Model and embedder must be loaded before calling predictor()")
+
+    # embed text
+    try:
+        emb = embedder.encode([catalog_content], device=str(device), show_progress_bar=False)[0]
+    except TypeError:
+        emb = embedder.encode([catalog_content], show_progress_bar=False)[0]
+    emb = np.asarray(emb).reshape(1, -1).astype(np.float32)
+
+    ipq = np.log1p(extract_ipq(catalog_content)).reshape(1, -1).astype(np.float32)
+    text_len = np.log1p(len(catalog_content) if isinstance(catalog_content, str) else 0).reshape(1, -1).astype(np.float32)
+
+    # process image
+    image_feature = np.zeros((1, 1000), dtype=np.float32)
+    if (not NO_IMAGES) and image_link:
+        tmp = f"temp_img_{sample_id}.jpg"
+        ok = download_images(image_link, tmp)
+        if ok and os.path.exists(tmp):
+            try:
+                with Image.open(tmp) as img:
+                    img = img.convert('RGB')
+                    img_t = preprocess(img).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        feat = resnet(img_t)
+                    feat = feat.cpu().numpy().reshape(1, -1)
+                    if feat.shape[1] == 1000:
+                        image_feature = feat.astype(np.float32)
+            except Exception:
+                image_feature = np.zeros((1, 1000), dtype=np.float32)
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+    X = np.hstack((emb, ipq, text_len, image_feature)).astype(np.float32)
+    pred_log = model.predict(X)
+    # model was trained on log1p(price)
+    pred_price = np.expm1(pred_log[0])
+    pred_price = float(max(0.01, pred_price))
+    return round(pred_price, 2)
+
+# --- Main script ---
 if __name__ == "__main__":
-    DATASET_FOLDER = 'dataset/'
-    
-    # Load and preprocess training data
+    DATASET_FOLDER = 'dataset'
     train_path = os.path.join(DATASET_FOLDER, 'train.csv')
+    test_path = os.path.join(DATASET_FOLDER, 'test.csv')
+
     if not os.path.exists(train_path):
-        print(f"Error: {train_path} not found. Please ensure the dataset folder contains train.csv.")
-        exit(1)
-    
+        print(f"Error: {train_path} not found.")
+        raise SystemExit(1)
+    if not os.path.exists(test_path):
+        print(f"Error: {test_path} not found.")
+        raise SystemExit(1)
+
     df_train = pd.read_csv(train_path)
+    # ensure required columns exist
+    if 'price' not in df_train.columns:
+        raise KeyError("train.csv must contain 'price' column")
     df_train['price_num'] = pd.to_numeric(df_train['price'], errors='coerce')
     df_train = df_train[df_train['price_num'] > 0].reset_index(drop=True)
-    y_train = np.log1p(df_train['price_num'].values)
-    
-    # Feature engineering
-    embedder = SentenceTransformer('multi-qa-mpnet-base-dot-v1')  # 768-dimensional embeddings
-    X_train = create_features(df_train, embedder)
-    
-    # Hyperparameter tuning with regularization
-    param_grid = {
-        'n_estimators': [500, 1000],
-        'learning_rate': [0.005, 0.01],
-        'max_depth': [20, 25],
-        'num_leaves': [63, 127],
-        'lambda_l1': [0.1, 0.5],
-        'lambda_l2': [0.1, 0.5]
-    }
+    y_train = np.log1p(df_train['price_num'].values).astype(np.float32)
+
+    # prepare embedder (unless smoke or NO embedder desired)
+    if not SMOKE:
+        embedder = SentenceTransformer('multi-qa-mpnet-base-dot-v1')
+    else:
+        embedder = None  # will use TF-IDF fallback
+
+    # create features (this will also initialize resnet/preprocess globals if images used)
+    print("Creating training features... (this may take a while)")
+    X_train = create_features(df_train, embedder_obj=embedder, image_dir=os.path.join(DATASET_FOLDER, "images"))
+    X_train = np.nan_to_num(X_train).astype(np.float32)
+
+    # hyperparameter grid
+    if SMOKE:
+        param_grid = {
+            'n_estimators': [200],
+            'learning_rate': [0.01],
+            'max_depth': [10],
+            'num_leaves': [31],
+            'lambda_l1': [0.0],
+            'lambda_l2': [0.0]
+        }
+    else:
+        param_grid = {
+            'n_estimators': [500],  # reduced grid to keep run-time reasonable; expand as needed
+            'learning_rate': [0.005, 0.01],
+            'max_depth': [20],
+            'num_leaves': [63],
+            'lambda_l1': [0.1],
+            'lambda_l2': [0.1]
+        }
+
+    # prepare folds (try stratified, else fallback)
+    try:
+        price_bins = pd.qcut(df_train['price_num'], 5, labels=False, duplicates='drop')
+        kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        split_func = lambda X, y: kf.split(X, price_bins)
+    except Exception:
+        print("Could not use StratifiedKFold (maybe too few unique bins). Falling back to KFold.")
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        split_func = lambda X, y: kf.split(X)
+
+    def smape_from_true_and_pred(y_true_vals, y_pred_vals):
+        # y_true_vals and y_pred_vals are raw prices, not logs
+        eps = 1e-8
+        num = 2 * np.abs(y_pred_vals - y_true_vals)
+        den = np.abs(y_pred_vals) + np.abs(y_true_vals) + eps
+        return 100.0 * np.mean(num / den)
+
     best_smape = float('inf')
     best_params = None
-    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    price_bins = pd.qcut(df_train['price_num'], 5, labels=False)
-    
+
+    # grid search (nested loops)
     for n_est in param_grid['n_estimators']:
         for lr in param_grid['learning_rate']:
             for md in param_grid['max_depth']:
@@ -169,10 +307,11 @@ if __name__ == "__main__":
                     for l1 in param_grid['lambda_l1']:
                         for l2 in param_grid['lambda_l2']:
                             cv_smape = []
-                            for train_idx, val_idx in kf.split(X_train, price_bins):
+                            for train_idx, val_idx in split_func(X_train, y_train):
                                 X_tr, X_val_cv = X_train[train_idx], X_train[val_idx]
                                 y_tr, y_val_cv = y_train[train_idx], y_train[val_idx]
-                                model = lgb.LGBMRegressor(
+
+                                reg = lgb.LGBMRegressor(
                                     n_estimators=n_est,
                                     learning_rate=lr,
                                     max_depth=md,
@@ -180,24 +319,41 @@ if __name__ == "__main__":
                                     lambda_l1=l1,
                                     lambda_l2=l2,
                                     random_state=42,
-                                    verbose=-1
+                                    n_jobs=4,
                                 )
-                                model.fit(X_tr, y_tr, early_stopping_rounds=50, eval_set=[(X_val_cv, y_val_cv)],
-                                          eval_metric='l1', verbose=False)
-                                y_val_pred_cv = np.expm1(model.predict(X_val_cv))
-                                smape_cv = 100 * np.mean(2 * np.abs(y_val_pred_cv - np.expm1(y_val_cv)) / 
-                                                      (np.abs(y_val_pred_cv) + np.abs(np.expm1(y_val_cv)) + 1e-8))
+                                # fit with early stopping on eval_set (scikit-learn wrapper supports early_stopping_rounds param)
+                                try:
+                                    reg.fit(X_tr, y_tr,
+                                            eval_set=[(X_val_cv, y_val_cv)],
+                                            early_stopping_rounds=50,
+                                            verbose=False)
+                                except TypeError:
+                                    # older versions may not accept early_stopping_rounds via sklearn wrapper
+                                    reg.fit(X_tr, y_tr)
+
+                                # predictions: model output is log1p(price)
+                                y_val_pred_log = reg.predict(X_val_cv)
+                                y_val_pred = np.expm1(y_val_pred_log)
+                                y_val_true = np.expm1(y_val_cv)
+                                smape_cv = smape_from_true_and_pred(y_val_true, y_val_pred)
                                 cv_smape.append(smape_cv)
+
                             avg_smape = np.mean(cv_smape)
                             print(f"Params: n_est={n_est}, lr={lr}, md={md}, nl={nl}, l1={l1}, l2={l2}, Avg SMAPE={avg_smape:.2f}%")
                             if avg_smape < best_smape:
                                 best_smape = avg_smape
-                                best_params = {'n_estimators': n_est, 'learning_rate': lr, 'max_depth': md,
-                                              'num_leaves': nl, 'lambda_l1': l1, 'lambda_l2': l2}
-    
+                                best_params = {
+                                    'n_estimators': n_est, 'learning_rate': lr,
+                                    'max_depth': md, 'num_leaves': nl,
+                                    'lambda_l1': l1, 'lambda_l2': l2
+                                }
+
     print(f"Best parameters: {best_params}, Best CV SMAPE: {best_smape:.2f}%")
-    
-    # Train final model with best parameters
+
+    # Train final model using best params on full training set
+    if best_params is None:
+        raise RuntimeError("No best params found (grid may be empty)")
+
     model = lgb.LGBMRegressor(
         n_estimators=best_params['n_estimators'],
         learning_rate=best_params['learning_rate'],
@@ -206,39 +362,35 @@ if __name__ == "__main__":
         lambda_l1=best_params['lambda_l1'],
         lambda_l2=best_params['lambda_l2'],
         random_state=42,
-        verbose=-1
+        n_jobs=4
     )
+
+    print("Training final model on full training set...")
     model.fit(X_train, y_train)
-    
-    # Validate on holdout set
-    X_train_split, X_val, y_train_split, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
-    model.fit(X_train_split, y_train_split)
+
+    # quick holdout validation
+    X_tr_split, X_val, y_tr_split, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
+    model.fit(X_tr_split, y_tr_split)
     y_val_pred = np.expm1(model.predict(X_val))
-    smape = 100 * np.mean(2 * np.abs(y_val_pred - np.expm1(y_val)) / (np.abs(y_val_pred) + np.abs(np.expm1(y_val)) + 1e-8))
-    print(f"Final Validation SMAPE: {smape:.2f}%")
-    
-    # Read test data
-    test_path = os.path.join(DATASET_FOLDER, 'test.csv')
-    if not os.path.exists(test_path):
-        print(f"Error: {test_path} not found. Please ensure the dataset folder contains test.csv.")
-        exit(1)
-    
-    test = pd.read_csv(test_path)
-    
-    # Generate predictions
-    print("Generating predictions...")
-    X_test = create_features(test, embedder)
-    
+    y_val_true = np.expm1(y_val)
+    final_smape = smape_from_true_and_pred(y_val_true, y_val_pred)
+    print(f"Final Validation SMAPE on holdout: {final_smape:.2f}%")
+
+    # Read test and predict
+    print("Creating test features and generating predictions...")
+    df_test = pd.read_csv(test_path)
+    X_test = create_features(df_test, embedder_obj=embedder, image_dir=os.path.join(DATASET_FOLDER, "images"))
+    X_test = np.nan_to_num(X_test).astype(np.float32)
+
     pred_log = model.predict(X_test)
     pred_prices = np.expm1(pred_log)
-    pred_prices = np.clip(pred_prices, 0.01, None)  # Ensure positive
-    test['price'] = np.round(pred_prices.astype(float), 2)
-    
-    output_df = test[['sample_id', 'price']]
-    
+    pred_prices = np.clip(pred_prices, 0.01, None)
+    df_test['price'] = np.round(pred_prices.astype(float), 2)
+
+    output_df = df_test[['sample_id', 'price']] if 'sample_id' in df_test.columns else df_test[['price']].reset_index().rename(columns={'index':'sample_id'})
+
     output_filename = os.path.join(DATASET_FOLDER, 'test_out.csv')
     output_df.to_csv(output_filename, index=False)
-    
     print(f"Predictions saved to {output_filename}")
     print(f"Total predictions: {len(output_df)}")
-    print(f"Sample predictions:\n{output_df.head()}")
+    print(output_df.head())
