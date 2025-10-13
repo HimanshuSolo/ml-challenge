@@ -20,7 +20,6 @@ NO_IMAGES = bool(int(os.environ.get('NO_IMAGES', '0')))
 CACHE_DIR = os.path.join('dataset', 'cache')
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# --- fallback image downloader if src.utils not available ---
 try:
     from src.utils import download_images
 except Exception:
@@ -42,14 +41,12 @@ except Exception:
                     pass
             return False
 
-# globals used by predictor
 model = None
 embedder = None
 resnet = None
 preprocess = None
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# IPQ extraction function
 def extract_ipq(text):
     if not isinstance(text, str):
         return 1
@@ -71,7 +68,6 @@ def extract_ipq(text):
     m = re.search(r'\b(\d+)\s*(?:items|units)?\b', text)
     return max(1, int(m.group(1))) if m else 1
 
-# Feature engineering
 def create_features(df, embedder_obj=None, image_dir="dataset/images/"):
     """
     Create features for text (embeddings or TF-IDF+SVD) and images (ResNet).
@@ -82,7 +78,6 @@ def create_features(df, embedder_obj=None, image_dir="dataset/images/"):
     os.makedirs(image_dir, exist_ok=True)
     catalog_content = df['catalog_content'].fillna('').astype(str)
 
-    # 1) Text embeddings or TF-IDF+SVD fallback
     if SMOKE or embedder_obj is None:
         tfidf_cache = os.path.join(CACHE_DIR, f'tfidf_svd_smoke{int(SMOKE)}.npz')
         if os.path.exists(tfidf_cache):
@@ -102,33 +97,26 @@ def create_features(df, embedder_obj=None, image_dir="dataset/images/"):
             data = np.load(embed_cache)
             embeddings = data['emb']
         else:
-            # prefer using the right device if sentence-transformers supports it
             encode_kwargs = dict(show_progress_bar=True, batch_size=64)
             try:
                 embeddings = embedder_obj.encode(catalog_content.tolist(), device=str(device), **encode_kwargs)
             except TypeError:
-                # fallback if embedder doesn't accept device param
                 embeddings = embedder_obj.encode(catalog_content.tolist(), **encode_kwargs)
             embeddings = np.asarray(embeddings, dtype=np.float32)
             np.savez_compressed(embed_cache, emb=embeddings)
 
-    # small numeric features
     ipq = np.log1p(catalog_content.apply(extract_ipq)).values.reshape(-1, 1).astype(np.float32)
     text_length = np.log1p(catalog_content.str.len().values.reshape(-1, 1)).astype(np.float32)
 
     n = len(df)
-    # prepare image features
-    image_features = np.zeros((n, 1000), dtype=np.float32)  # final resnet classifier output dim
+    image_features = np.zeros((n, 1000), dtype=np.float32)  #
 
-    # prepare ResNet and preprocess once (only if using images)
     if not NO_IMAGES:
-        # define preprocess if not already
         preprocess = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        # load resnet if not loaded
         if resnet is None:
             resnet = models.resnet50(pretrained=True)
             resnet = resnet.to(device)
@@ -139,26 +127,23 @@ def create_features(df, embedder_obj=None, image_dir="dataset/images/"):
 
         image_links = df.get('image_link', pd.Series(['']*n)).fillna('').values
 
-        # iterate images (sequentially). Use try/except to skip failures.
         for i, url in enumerate(tqdm(image_links, desc="Processing images", disable=SMOKE)):
             if not url:
                 continue
             save_path = os.path.join(image_dir, f"img_{i}.jpg")
             ok = download_images(url, save_path)
             if not ok or not os.path.exists(save_path):
-                # skip
                 continue
             try:
                 with Image.open(save_path) as img:
                     img = img.convert('RGB')
                     img_t = preprocess(img).unsqueeze(0).to(device)
                     with torch.no_grad():
-                        feat = resnet(img_t)  # (1,1000)
+                        feat = resnet(img_t)
                     feat = feat.cpu().numpy().reshape(-1)
                     if feat.shape[0] == 1000:
                         image_features[i] = feat.astype(np.float32)
             except Exception:
-                # skip this image
                 pass
             finally:
                 try:
@@ -166,28 +151,22 @@ def create_features(df, embedder_obj=None, image_dir="dataset/images/"):
                 except Exception:
                     pass
     else:
-        # NO_IMAGES mode: keep image_features as zeros
         pass
 
-    # combine everything
-    # ensure embeddings is numpy and 2D
     embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim == 1:
         embeddings = embeddings.reshape(-1, 1)
 
-    # ensure shapes align
     assert embeddings.shape[0] == n, f"Embeddings rows {embeddings.shape[0]} != samples {n}"
 
     X = np.hstack((embeddings, ipq, text_length, image_features)).astype(np.float32)
     return X
 
-# predictor that uses global model, embedder, resnet, preprocess
 def predictor(sample_id, catalog_content, image_link):
     global model, embedder, resnet, preprocess, device
     if model is None or embedder is None:
         raise RuntimeError("Model and embedder must be loaded before calling predictor()")
 
-    # embed text
     try:
         emb = embedder.encode([catalog_content], device=str(device), show_progress_bar=False)[0]
     except TypeError:
@@ -197,7 +176,6 @@ def predictor(sample_id, catalog_content, image_link):
     ipq = np.log1p(extract_ipq(catalog_content)).reshape(1, -1).astype(np.float32)
     text_len = np.log1p(len(catalog_content) if isinstance(catalog_content, str) else 0).reshape(1, -1).astype(np.float32)
 
-    # process image
     image_feature = np.zeros((1, 1000), dtype=np.float32)
     if (not NO_IMAGES) and image_link:
         tmp = f"temp_img_{sample_id}.jpg"
@@ -222,12 +200,10 @@ def predictor(sample_id, catalog_content, image_link):
 
     X = np.hstack((emb, ipq, text_len, image_feature)).astype(np.float32)
     pred_log = model.predict(X)
-    # model was trained on log1p(price)
     pred_price = np.expm1(pred_log[0])
     pred_price = float(max(0.01, pred_price))
     return round(pred_price, 2)
 
-# --- Main script ---
 if __name__ == "__main__":
     DATASET_FOLDER = 'dataset'
     train_path = os.path.join(DATASET_FOLDER, 'train.csv')
@@ -241,25 +217,21 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     df_train = pd.read_csv(train_path)
-    # ensure required columns exist
     if 'price' not in df_train.columns:
         raise KeyError("train.csv must contain 'price' column")
     df_train['price_num'] = pd.to_numeric(df_train['price'], errors='coerce')
     df_train = df_train[df_train['price_num'] > 0].reset_index(drop=True)
     y_train = np.log1p(df_train['price_num'].values).astype(np.float32)
 
-    # prepare embedder (unless smoke or NO embedder desired)
     if not SMOKE:
         embedder = SentenceTransformer('multi-qa-mpnet-base-dot-v1')
     else:
-        embedder = None  # will use TF-IDF fallback
+        embedder = None  
 
-    # create features (this will also initialize resnet/preprocess globals if images used)
     print("Creating training features... (this may take a while)")
     X_train = create_features(df_train, embedder_obj=embedder, image_dir=os.path.join(DATASET_FOLDER, "images"))
     X_train = np.nan_to_num(X_train).astype(np.float32)
 
-    # hyperparameter grid
     if SMOKE:
         param_grid = {
             'n_estimators': [200],
@@ -271,7 +243,7 @@ if __name__ == "__main__":
         }
     else:
         param_grid = {
-            'n_estimators': [500],  # reduced grid to keep run-time reasonable; expand as needed
+            'n_estimators': [500],  
             'learning_rate': [0.005, 0.01],
             'max_depth': [20],
             'num_leaves': [63],
@@ -279,7 +251,6 @@ if __name__ == "__main__":
             'lambda_l2': [0.1]
         }
 
-    # prepare folds (try stratified, else fallback)
     try:
         price_bins = pd.qcut(df_train['price_num'], 5, labels=False, duplicates='drop')
         kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -290,7 +261,6 @@ if __name__ == "__main__":
         split_func = lambda X, y: kf.split(X)
 
     def smape_from_true_and_pred(y_true_vals, y_pred_vals):
-        # y_true_vals and y_pred_vals are raw prices, not logs
         eps = 1e-8
         num = 2 * np.abs(y_pred_vals - y_true_vals)
         den = np.abs(y_pred_vals) + np.abs(y_true_vals) + eps
@@ -321,17 +291,14 @@ if __name__ == "__main__":
                                     random_state=42,
                                     n_jobs=4,
                                 )
-                                # fit with early stopping on eval_set (scikit-learn wrapper supports early_stopping_rounds param)
                                 try:
                                     reg.fit(X_tr, y_tr,
                                             eval_set=[(X_val_cv, y_val_cv)],
                                             early_stopping_rounds=50,
                                             verbose=False)
                                 except TypeError:
-                                    # older versions may not accept early_stopping_rounds via sklearn wrapper
                                     reg.fit(X_tr, y_tr)
 
-                                # predictions: model output is log1p(price)
                                 y_val_pred_log = reg.predict(X_val_cv)
                                 y_val_pred = np.expm1(y_val_pred_log)
                                 y_val_true = np.expm1(y_val_cv)
@@ -350,7 +317,6 @@ if __name__ == "__main__":
 
     print(f"Best parameters: {best_params}, Best CV SMAPE: {best_smape:.2f}%")
 
-    # Train final model using best params on full training set
     if best_params is None:
         raise RuntimeError("No best params found (grid may be empty)")
 
@@ -368,7 +334,6 @@ if __name__ == "__main__":
     print("Training final model on full training set...")
     model.fit(X_train, y_train)
 
-    # quick holdout validation
     X_tr_split, X_val, y_tr_split, y_val = train_test_split(X_train, y_train, test_size=0.2, random_state=42)
     model.fit(X_tr_split, y_tr_split)
     y_val_pred = np.expm1(model.predict(X_val))
@@ -376,7 +341,6 @@ if __name__ == "__main__":
     final_smape = smape_from_true_and_pred(y_val_true, y_val_pred)
     print(f"Final Validation SMAPE on holdout: {final_smape:.2f}%")
 
-    # Read test and predict
     print("Creating test features and generating predictions...")
     df_test = pd.read_csv(test_path)
     X_test = create_features(df_test, embedder_obj=embedder, image_dir=os.path.join(DATASET_FOLDER, "images"))
