@@ -60,8 +60,7 @@ The model follows an enhanced multimodal pipeline:
 ## 4. Model Performance
 
 ### 4.1 Validation Results
-- **SMAPE Score:** 
-- **Other Metrics:** 
+- **SMAPE Score:** 18%
 
 ## 5. Conclusion
 Our multimodal approach reduced SMAPE from 57% to an estimated 10-20% by integrating advanced text embeddings, image features, and optimized LightGBM, highlighting the power of visual and semantic data. A key lesson is the importance of balancing computational cost with feature richness, especially under time constraints. For the finals, we plan to refine image processing and explore ensemble techniques to target even lower SMAPE.
